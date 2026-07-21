@@ -28,6 +28,7 @@
 # Run on the router as root.
 
 . /lib/functions.sh
+. /lib/mwan3/common.sh
 
 TABLE="inet mwan3"
 FORWARD_TABLE="inet fw4"
@@ -200,10 +201,13 @@ config_load mwan3
 
 collect_member() {
 	local member="$1"
-	local iface weight
+	local iface weight member_family wanted_family
 	config_get iface  "$member" interface ""
 	config_get weight "$member" weight    1
 	[ -z "$iface" ] && return
+	config_get member_family "$iface" family ipv4
+	[ "$IPV6" -eq 1 ] && wanted_family=ipv6 || wanted_family=ipv4
+	[ "$member_family" = "$wanted_family" ] || return
 	MEMBERS="$MEMBERS $member"
 	MEMBER_IFACES="$MEMBER_IFACES $iface"
 	MEMBER_WEIGHTS="$MEMBER_WEIGHTS $weight"
@@ -223,36 +227,58 @@ MEMBER_COUNT=$(echo "$MEMBER_WEIGHTS" | wc -w)
 # ---------------------------------------------------------------------------
 # Pre-flight: parse member marks from live numgen vmap
 #
-# The vmap entries are in member order, matching UCI use_member list order.
-# Each entry jumps to mwan3_or_meta_0xMARK; extract MARK from chain name.
+# Static vmap entries are inline. Adaptive policies reference a named verdict
+# map, so resolve and snapshot that map before extracting marks.
 # ---------------------------------------------------------------------------
 
-MEMBER_MARKS=$(echo "$NUMGEN_LINE" \
-	| grep -oE 'mwan3_or_meta_0x[0-9a-f]+' \
-	| sed 's/mwan3_or_meta_//')
+MAP_NAME=$(echo "$NUMGEN_LINE" | \
+	grep -oE '@mwan3_adaptive_v[46]_[A-Za-z0-9_-]+' | \
+	grep "@mwan3_adaptive_v$([ "$IPV6" -eq 1 ] && echo 6 || echo 4)_" | \
+	head -1 | sed 's/^@//')
+MAP_DUMP=""
+[ -n "$MAP_NAME" ] && MAP_DUMP=$(nft list map $TABLE "$MAP_NAME" 2>/dev/null)
+MARK_SOURCE="$NUMGEN_LINE $MAP_DUMP"
 
-MARK_COUNT=$(echo "$MEMBER_MARKS" | wc -w)
-
-# For mixed IPv4/IPv6 policies there may be two numgen lines; marks may repeat.
-# Deduplicate while preserving order.
-MEMBER_MARKS=$(echo "$MEMBER_MARKS" | tr ' ' '\n' | awk '!seen[$0]++' | tr '\n' ' ')
-MEMBER_MARKS="${MEMBER_MARKS% }"
-MARK_COUNT=$(echo "$MEMBER_MARKS" | wc -w)
-
-[ "$MARK_COUNT" -lt 2 ] \
-	&& die "could not parse at least two member marks from numgen vmap"
-
-[ "$MARK_COUNT" -ne "$MEMBER_COUNT" ] \
-	&& warn "mark count ($MARK_COUNT) differs from UCI member count ($MEMBER_COUNT) - mixed IPv4/IPv6 policy; per-member results may be approximate"
-
-# Normalise marks to consistent hex format (no leading zeros beyond 0x prefix)
-# so our inserted rule syntax and the awk extraction both use the same values.
-MEMBER_MARKS_NORM=""
-for mark in $MEMBER_MARKS; do
-	norm=$(printf "0x%x" "$((mark))")
-	MEMBER_MARKS_NORM="$MEMBER_MARKS_NORM $norm"
+# Derive each mark from the UCI interface index so marks remain aligned with
+# MEMBERS/MEMBER_WEIGHTS even when smooth scheduling starts with a later,
+# heavier member. Parsing first appearance order from the map is incorrect.
+CONFIG_IFACES=""
+collect_config_iface() { CONFIG_IFACES="$CONFIG_IFACES $1"; }
+config_foreach collect_config_iface interface
+CONFIG_IFACES="${CONFIG_IFACES# }"
+MEMBER_MARKS=""
+i=1
+for iface in $MEMBER_IFACES; do
+	id=0
+	j=1
+	for configured_iface in $CONFIG_IFACES; do
+		[ "$configured_iface" = "$iface" ] && { id=$j; break; }
+		j=$((j + 1))
+	done
+	[ "$id" -gt 0 ] || die "could not resolve interface id for $iface"
+	mark=$(mwan3_id2mask "$id" "$MMX_MASK")
+	echo "$MARK_SOURCE" | grep -q "mwan3_or_meta_${mark}" ||
+		die "live policy map does not contain mark $mark for $iface"
+	MEMBER_MARKS="$MEMBER_MARKS $mark"
+	i=$((i + 1))
 done
-MEMBER_MARKS="${MEMBER_MARKS_NORM# }"
+MEMBER_MARKS="${MEMBER_MARKS# }"
+
+LIVE_WEIGHTS=""
+for mark in $MEMBER_MARKS; do
+	count=$(echo "$MARK_SOURCE" | grep -o "mwan3_or_meta_${mark}" | wc -l)
+	[ "$count" -gt 0 ] || die "live policy map gives no slots to mark $mark"
+	LIVE_WEIGHTS="$LIVE_WEIGHTS $count"
+done
+MEMBER_WEIGHTS="${LIVE_WEIGHTS# }"
+
+if [ -n "$MAP_DUMP" ]; then
+	ADAPTIVE_POLICY=1
+	warn "adaptive policy detected; expected shares use the current map snapshot"
+	warn "the controller may update that map while this test is running"
+else
+	ADAPTIVE_POLICY=0
+fi
 
 # ---------------------------------------------------------------------------
 # Startup cleanup: remove stale mwan3_lb_test_* artifacts from aborted runs
@@ -725,6 +751,9 @@ fi
 if [ "$FW4_RELOADED" -eq 1 ]; then
 	echo "FAIL: test invalidated - fw4 reload wiped counter rules during the wait."
 	echo "      Re-run the test and do not leave it unattended for more than a few minutes."
+elif [ "$ADAPTIVE_POLICY" -eq 1 ]; then
+	echo "NOTE: adaptive policy results are observational, not a fixed-weight PASS/FAIL."
+	echo "      Expected values use the starting map; the controller may change it during the test."
 elif [ "$PASS" -eq 1 ] && [ "$CONTAMINATED" -eq 0 ]; then
 	echo "PASS: distribution matches expected weights within tolerance (+/-2 per member)."
 	echo "      Load balancing is working according to configured policy."

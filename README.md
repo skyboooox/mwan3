@@ -1245,19 +1245,30 @@ The iptables version used `-m statistic --mode random --probability P` to distri
 
 ### How numgen Works
 
-`numgen inc mod N` generates a counter that increments on each packet and wraps at N. The `map { range : value }` maps counter values to marks.
+`numgen inc mod N` generates a counter that increments for each unmarked new
+connection that reaches the policy and wraps at N. The verdict map jumps to a
+masked mark-setter chain; the selected mark is then saved in conntrack.
 
 ```
-# Example: wan (weight 3) + wanb (weight 2) = mod 5
-# wan gets range 0-2 (3 values), wanb gets range 3-4 (2 values)
+# Example: wan (weight 3) + wanb (weight 2) = mod 5.
+# Smooth weighted round-robin interleaves the slots instead of assigning one
+# contiguous burst to each member.
 
 nft add rule inet mwan3 mwan3_policy_balanced \
     meta mark & 0x3f00 == 0 \
-    meta mark set numgen inc mod 5 map { 0-2 : 0x0100, 3-4 : 0x0200 }
+    numgen inc mod 5 vmap { \
+        0 : jump mwan3_or_meta_0x100, 1 : jump mwan3_or_meta_0x200, \
+        2 : jump mwan3_or_meta_0x100, 3 : jump mwan3_or_meta_0x200, \
+        4 : jump mwan3_or_meta_0x100 \
+    }
 ```
 
 > [!WARNING]
-> **Kernel limitation on compound set expressions:** An early implementation tried `meta mark set meta mark & COMP | numgen inc mod ...` to preserve non-mwan3 bits while applying the numgen result. This fails with "Operation not supported" because the kernel cannot mix two register sources (meta mark and numgen) in one set expression. The solution is to use `meta mark set numgen ...` directly; the `meta mark & MMX_MASK == 0` guard condition ensures the mwan3 bits are already zero before the numgen result is applied.
+> **Kernel limitation on compound set expressions:** An implementation cannot
+> combine the existing meta mark and a numgen result in one set expression;
+> the kernel rejects two runtime register sources. The verdict map therefore
+> jumps to a small OR-immediate setter chain. This preserves mark bits owned by
+> other packages while changing only mwan3's mask.
 
 ### Build Algorithm (in `mwan3_create_policies_nft`)
 
@@ -1266,11 +1277,70 @@ nft add rule inet mwan3 mwan3_policy_balanced \
 3. Accumulate online members as `iface:id:weight` tuples
 4. Calculate total weight = sum of all member weights
 5. If single member: direct `meta mark set` (no numgen overhead)
-6. If multiple members: build numgen map entries with ranges proportional to weight
+6. If multiple members: build a smooth weighted round-robin verdict map
 7. Append last-resort rule (unreachable/blackhole/default)
 
 > [!NOTE]
-> **Difference from iptables version:** The iptables version used probabilistic matching (`--probability`) which is statistically correct over many packets but can have short-term imbalance. The nftables `numgen inc` counter gives perfectly deterministic round-robin distribution at the configured weights.
+> **Difference from iptables version:** The iptables version used probabilistic
+> matching (`--probability`) which is statistically correct over many packets
+> but can have short-term imbalance. The nftables `numgen inc` counter and
+> interleaved slots give deterministic, burst-safe distribution at the
+> configured weights.
+
+### Adaptive policies
+
+Adaptive scheduling is optional and application agnostic. Add `option mode
+'adaptive'` to a policy, then provide every participating `config interface`
+with `capacity_down` (Mbit/s) and `telemetry_device`. A parent device that also
+counts child/macvlan traffic can list those children with
+`telemetry_subtract`; the controller subtracts their RX deltas before
+calculating the member's load.
+
+```uci
+config interface 'wan_a1'
+	option capacity_down '1300'
+	option telemetry_device 'wan'
+	list telemetry_subtract 'wan-a2'
+	list telemetry_subtract 'wan-b'
+
+config interface 'wan_a2'
+	option capacity_down '1300'
+	option telemetry_device 'wan-a2'
+
+config capacity_group 'shared_access'
+	option capacity_down '1300'
+	list interface 'wan_a1'
+	list interface 'wan_a2'
+
+config policy 'balanced'
+	option mode 'adaptive'
+	list use_member 'wan_a1_member'
+	list use_member 'wan_a2_member'
+	list use_member 'wan_b_member'
+```
+
+`mwan3-adaptive` samples hardware-visible RX counters and smooths member and
+shared-capacity-group utilization. Scheduling credit is based on absolute
+remaining bandwidth, not utilization percentage alone, and is then multiplied
+by the configured member weight as an explicit policy bias. A shared group's
+remaining bandwidth is counted once and divided among its selected members in
+proportion to their nominal capacities before bias is applied. This prevents
+two PPPoE sessions on one access link from claiming two copies of the same
+physical headroom.
+
+The controller atomically replaces a fixed-size named verdict map, so only
+future connections see the new distribution. Existing connections retain
+their conntrack mark and never move between WANs. If telemetry is incomplete,
+reset, overlapping between groups, or otherwise invalid, the controller leaves
+the last valid map in place.
+
+Global tuning is deliberately conservative: `adaptive_interval` defaults to 3
+seconds, `adaptive_buckets` to 256, `adaptive_smoothing` to 75 percent retained
+history, and `adaptive_min_headroom` to 50 permille. Static policies use their
+exact reduced weight cycle up to `static_balance_buckets` (default 256); larger
+cycles are approximated in that bounded number of interleaved slots with at
+least one slot per active member. Adaptive mode is disabled unless a policy
+explicitly selects it.
 
 ---
 
@@ -4413,4 +4483,3 @@ config_load mwan3
 mwan3_init
 mwan3_flush_marked_conntrack
 ```
-

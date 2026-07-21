@@ -111,7 +111,7 @@ mwan3_nft_batch_commit()
 
 mwan3_nft_reload_start()
 {
-	local chain setname
+	local chain setname mapname
 	mwan3_nft_batch_start
 	for chain in mwan3_prerouting mwan3_output mwan3_postrouting \
 	             mwan3_ifaces_in mwan3_rules mwan3_connected mwan3_custom mwan3_dynamic; do
@@ -136,6 +136,18 @@ mwan3_nft_reload_start()
 				;;
 		esac
 	done
+
+	# Policy chains are now empty, so they no longer reference adaptive maps.
+	# Remove the maps next: their verdicts reference mark-setter chains that the
+	# final pass below must be able to delete. Sticky maps contain marks rather
+	# than verdicts and deliberately remain untouched.
+
+	for mapname in $($NFT list maps inet mwan3 2>/dev/null | \
+			awk '$1 == "map" && $2 ~ /^mwan3_adaptive_/ { print $2 }'); do
+		mwan3_nft_push "flush map inet mwan3 $mapname"
+		mwan3_nft_push "delete map inet mwan3 $mapname"
+	done
+
 	for chain in $_dyn_chains; do
 		mwan3_nft_push "delete chain inet mwan3 $chain"
 	done
@@ -561,4 +573,3 @@ get_online_time() {
 		export -n "$1=$((time_n-time_u))"
 	}
 }
-

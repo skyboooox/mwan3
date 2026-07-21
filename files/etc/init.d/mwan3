@@ -32,6 +32,23 @@ start_tracker() {
 	procd_close_instance
 }
 
+adaptive_policy_enabled() {
+	local mode
+	config_get mode "$1" mode static
+	[ "$mode" = adaptive ] && MWAN3_ADAPTIVE_ENABLED=1
+}
+
+start_adaptive() {
+	MWAN3_ADAPTIVE_ENABLED=0
+	config_foreach adaptive_policy_enabled policy
+	[ "$MWAN3_ADAPTIVE_ENABLED" -eq 1 ] || return 0
+
+	procd_open_instance adaptive
+	procd_set_param command /usr/sbin/mwan3-adaptive
+	procd_set_param respawn
+	procd_close_instance
+}
+
 start_service() {
 	local enabled hotplug_pids
 
@@ -72,6 +89,7 @@ start_service() {
 	mwan3_set_general_nft
 	mwan3_set_policies_nft
 	mwan3_set_user_rules
+	start_adaptive
 	mwan3_flush_stale_conntrack
 	mwan3_dnsmasq_hup
 
@@ -99,6 +117,7 @@ start_service() {
 
 stop_service() {
 	service_running || exit 0
+	local _map
 
 	# Stop mwan3track instances before tearing down routing
 	# infrastructure. procd sends TERM only after stop_service returns,
@@ -114,6 +133,16 @@ stop_service() {
 		procd_kill mwan3 "track_$_iface" && _killed=1
 	done
 	[ -n "$_killed" ] && sleep 1
+
+	# Adaptive verdict maps hold jump references to dynamic mark-setter chains.
+	# Stop the controller and empty those maps before chain teardown. The maps
+	# themselves are still referenced by policy rules here, so the common map
+	# cleanup below deletes them after those chains have been removed.
+	procd_kill mwan3 adaptive 2>/dev/null || true
+	for _map in $(nft list maps inet mwan3 2>/dev/null | \
+			awk '$1 == "map" && $2 ~ /^mwan3_adaptive_/ { print $2 }'); do
+		nft flush map inet mwan3 "$_map" 2>/dev/null
+	done
 
 	local chain_name IP family table tid
 
@@ -252,6 +281,11 @@ reload_service() {
 	mwan3_set_policies_nft
 	mwan3_set_user_rules
 	mwan3_nft_reload_commit || return 1
+	# The reload recreates adaptive maps with their configured baseline
+	# weights.  Invalidate controller-side map snapshots so the next sample
+	# reapplies the current adaptive distribution even if its calculation did
+	# not otherwise change.
+	rm -f "$MWAN3_STATUS_DIR"/adaptive/map.*
 
 	# ip rules and routing tables are kernel state outside nftables —
 	# update them after the nft commit so the table is already consistent.
@@ -290,6 +324,7 @@ reload_service() {
 	# starts the correct tracker set; start_service calls mwan3_dnsmasq_hup
 	# so nftset-populated sets are repopulated on name resolution.
 	local _expected_trackers=0 _running_trackers=0
+	local _expected_adaptive=0 _running_adaptive=0
 	_count_tracker_needed() {
 		local enabled track_ip track_gateway
 		config_get_bool enabled "$1" enabled 0
@@ -306,8 +341,16 @@ reload_service() {
 		procd_running mwan3 "track_$1" && _running_trackers=$((_running_trackers + 1))
 	}
 	config_foreach _count_running_tracker interface
-	if [ "$_running_trackers" -ne "$_expected_trackers" ]; then
-		LOG notice "reload: tracker mismatch (need $_expected_trackers, have $_running_trackers) -- restarting"
+	_check_adaptive_needed() {
+		local mode
+		config_get mode "$1" mode static
+		[ "$mode" = adaptive ] && _expected_adaptive=1
+	}
+	config_foreach _check_adaptive_needed policy
+	procd_running mwan3 adaptive && _running_adaptive=1
+	if [ "$_running_trackers" -ne "$_expected_trackers" ] || \
+	   [ "$_running_adaptive" -ne "$_expected_adaptive" ]; then
+		LOG notice "reload: service instance mismatch -- restarting"
 		stop
 		start
 	fi

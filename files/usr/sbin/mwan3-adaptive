@@ -1,0 +1,441 @@
+#!/bin/sh
+
+# Application-agnostic adaptive new-connection scheduler for mwan3.
+# Existing connections keep their conntrack mark; this process only replaces
+# the fixed verdict map used by future numgen selections.
+
+. /lib/functions.sh
+. /lib/functions/network.sh
+. /lib/mwan3/mwan3.sh
+initscript=/etc/init.d/mwan3
+. /lib/functions/procd.sh
+
+STATE_DIR=/var/run/mwan3/adaptive
+DRY_RUN=0
+RUN_ONCE=0
+
+case "${1:-}" in
+	--dry-run) DRY_RUN=1; RUN_ONCE=1 ;;
+	--once) RUN_ONCE=1 ;;
+	"") ;;
+	*) echo "Usage: mwan3-adaptive [--dry-run|--once]" >&2; exit 2 ;;
+esac
+
+safe_section_name()
+{
+	case "$1" in
+		''|*[!A-Za-z0-9_-]*) return 1 ;;
+	esac
+}
+
+safe_device_name()
+{
+	case "$1" in
+		''|*[!A-Za-z0-9_.:-]*) return 1 ;;
+	esac
+}
+
+positive_integer()
+{
+	case "$1" in
+		''|*[!0-9]*|0) return 1 ;;
+	esac
+}
+
+bounded_positive_integer()
+{
+	positive_integer "$1" && [ "$1" -le "$2" ]
+}
+
+read_number()
+{
+	local value
+	[ -r "$1" ] || return 1
+	read -r value < "$1"
+	case "$value" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	printf '%s\n' "$value"
+}
+
+monotonic_seconds()
+{
+	local uptime
+	[ -r /proc/uptime ] || return 1
+	read -r uptime _ < /proc/uptime
+	uptime="${uptime%%.*}"
+	case "$uptime" in ''|*[!0-9]*) return 1 ;; esac
+	printf '%s\n' "$uptime"
+}
+
+sample_device_delta()
+{
+	local dev="$1" current previous cache invalid_cache previous_file
+
+	safe_device_name "$dev" || return 1
+	cache="$STATE_DIR/delta.$dev"
+	invalid_cache="$STATE_DIR/delta_invalid.$dev"
+	[ -e "$invalid_cache" ] && return 1
+	if [ -r "$cache" ]; then
+		SAMPLE_DELTA=$(read_number "$cache") || return 1
+		return 0
+	fi
+
+	current=$(read_number "/sys/class/net/$dev/statistics/rx_bytes") || return 1
+	previous_file="$STATE_DIR/previous.$dev"
+	previous=$(read_number "$previous_file" 2>/dev/null || true)
+	if [ "$SAMPLE_INTERVAL" -gt 0 ] && [ -n "$previous" ] && \
+	   [ "$current" -ge "$previous" ]; then
+		SAMPLE_DELTA=$((current - previous))
+	else
+		: > "$invalid_cache"
+		printf '%s\n' "$current" > "$previous_file"
+		return 1
+	fi
+	printf '%s\n' "$current" > "$previous_file"
+	printf '%s\n' "$SAMPLE_DELTA" > "$cache"
+}
+
+measure_interface()
+{
+	local iface="$1" device capacity delta rate util old smoothing telemetry_valid=1 owner
+
+	safe_section_name "$iface" || return 0
+	rm -f "$STATE_DIR/rate.$iface" "$STATE_DIR/capacity.$iface"
+	config_get device "$iface" telemetry_device
+	config_get capacity "$iface" capacity_down
+	if ! safe_device_name "$device" || ! bounded_positive_integer "$capacity" 100000; then
+		rm -f "$STATE_DIR/member_util.$iface"
+		return 0
+	fi
+	owner=$(cat "$STATE_DIR/device_owner.$device" 2>/dev/null || true)
+	if [ "$owner" = INVALID ]; then
+		rm -f "$STATE_DIR/member_util.$iface"
+		return 0
+	elif [ -n "$owner" ] && [ "$owner" != "$iface" ]; then
+		rm -f "$STATE_DIR/rate.$owner" "$STATE_DIR/capacity.$owner" \
+			"$STATE_DIR/member_util.$owner" "$STATE_DIR/member_util.$iface"
+		printf '%s\n' INVALID > "$STATE_DIR/device_owner.$device"
+		return 0
+	fi
+	printf '%s\n' "$iface" > "$STATE_DIR/device_owner.$device"
+	if ! sample_device_delta "$device"; then
+		rm -f "$STATE_DIR/member_util.$iface"
+		return 0
+	fi
+	delta=$SAMPLE_DELTA
+
+	subtract_device()
+	{
+		if ! safe_device_name "$1" || [ "$1" = "$device" ] || \
+		   [ -e "$STATE_DIR/subtract_seen.$iface.$1" ]; then
+			telemetry_valid=0
+			return 0
+		fi
+		: > "$STATE_DIR/subtract_seen.$iface.$1"
+		if ! sample_device_delta "$1"; then
+			telemetry_valid=0
+			return 0
+		fi
+		if [ "$delta" -ge "$SAMPLE_DELTA" ]; then
+			delta=$((delta - SAMPLE_DELTA))
+		else
+			telemetry_valid=0
+		fi
+	}
+	config_list_foreach "$iface" telemetry_subtract subtract_device
+	if [ "$telemetry_valid" -eq 0 ]; then
+		rm -f "$STATE_DIR/member_util.$iface"
+		return 0
+	fi
+
+	rate=$((delta * 8 / SAMPLE_INTERVAL / 1000))
+	util=$((rate * 1000 / (capacity * 1000)))
+	[ "$util" -le 2000 ] || util=2000
+	old=$(read_number "$STATE_DIR/member_util.$iface" 2>/dev/null || true)
+	[ -n "$old" ] || old=$util
+	smoothing=$ADAPTIVE_SMOOTHING
+	util=$((old * smoothing / 100 + util * (100 - smoothing) / 100))
+
+	printf '%s\n' "$rate" > "$STATE_DIR/rate.$iface"
+	printf '%s\n' "$capacity" > "$STATE_DIR/capacity.$iface"
+	printf '%s\n' "$util" > "$STATE_DIR/member_util.$iface"
+}
+
+measure_capacity_group()
+{
+	local group="$1" capacity sum=0 util old valid=1 available headroom
+
+	safe_section_name "$group" || return 0
+	invalidate_group_member()
+	{
+		safe_section_name "$1" || return 0
+		printf '%s\n' INVALID > "$STATE_DIR/group_name.$1"
+	}
+	rm -f "$STATE_DIR/group_headroom.$group"
+	config_get capacity "$group" capacity_down
+	if ! bounded_positive_integer "$capacity" 100000; then
+		rm -f "$STATE_DIR/group_util.$group"
+		config_list_foreach "$group" interface invalidate_group_member
+		return 0
+	fi
+
+	add_group_rate()
+	{
+		local member_rate member_capacity existing_group
+		safe_section_name "$1" || return 0
+		if [ -e "$STATE_DIR/group_seen.$group.$1" ]; then
+			valid=0
+			return 0
+		fi
+		: > "$STATE_DIR/group_seen.$group.$1"
+		member_rate=$(read_number "$STATE_DIR/rate.$1" 2>/dev/null || true)
+		member_capacity=$(read_number "$STATE_DIR/capacity.$1" 2>/dev/null || true)
+		if [ -z "$member_rate" ] || [ -z "$member_capacity" ]; then
+			valid=0
+			return 0
+		fi
+		existing_group=$(cat "$STATE_DIR/group_name.$1" 2>/dev/null || true)
+		if [ -n "$existing_group" ] && [ "$existing_group" != "$group" ]; then
+			printf '%s\n' INVALID > "$STATE_DIR/group_name.$1"
+			valid=0
+			return 0
+		fi
+		sum=$((sum + member_rate))
+	}
+	config_list_foreach "$group" interface add_group_rate
+	if [ "$valid" -ne 1 ]; then
+		rm -f "$STATE_DIR/group_util.$group"
+		config_list_foreach "$group" interface invalidate_group_member
+		return 0
+	fi
+
+	util=$((sum * 1000 / (capacity * 1000)))
+	[ "$util" -le 2000 ] || util=2000
+	old=$(read_number "$STATE_DIR/group_util.$group" 2>/dev/null || true)
+	[ -n "$old" ] || old=$util
+	util=$((old * ADAPTIVE_SMOOTHING / 100 + util * (100 - ADAPTIVE_SMOOTHING) / 100))
+	printf '%s\n' "$util" > "$STATE_DIR/group_util.$group"
+	available=$((1000 - util))
+	[ "$available" -ge "$ADAPTIVE_MIN_HEADROOM" ] || available=$ADAPTIVE_MIN_HEADROOM
+	headroom=$((capacity * available))
+	printf '%s\n' "$headroom" > "$STATE_DIR/group_headroom.$group"
+
+	set_group_membership()
+	{
+		safe_section_name "$1" || return 0
+		printf '%s\n' "$group" > "$STATE_DIR/group_name.$1"
+	}
+	config_list_foreach "$group" interface set_group_membership
+}
+
+policy_has_adaptive_mode()
+{
+	local mode
+	config_get mode "$1" mode static
+	[ "$mode" = adaptive ] && ADAPTIVE_POLICY_FOUND=1
+}
+
+update_policy_family()
+{
+	local policy="$1" family="$2" fam_short map lowest=257 member_count=0
+	local valid=1 tuples="" total_raw=0 iface metric member_family state id
+	local weight rate capacity member_util available raw group group_headroom
+	local member_headroom group_capacity_sum group_share group_sum_file i
+	local slots batch entries_file old_entries
+
+	[ "$family" = ipv4 ] && fam_short=v4 || fam_short=v6
+	map="mwan3_adaptive_${fam_short}_${policy}"
+	$NFT list map inet mwan3 "$map" >/dev/null 2>&1 || return 0
+
+	find_lowest_metric()
+	{
+		config_get iface "$1" interface
+		config_get metric "$1" metric 1
+		[ -n "$iface" ] || return 0
+		config_get member_family "$iface" family ipv4
+		[ "$member_family" = "$family" ] || return 0
+		[ "$(mwan3_get_iface_hotplug_state "$iface")" = online ] || return 0
+		[ "$metric" -lt "$lowest" ] && lowest=$metric
+	}
+	config_list_foreach "$policy" use_member find_lowest_metric
+	[ "$lowest" -lt 257 ] || return 0
+
+	collect_adaptive_member()
+	{
+		local current_group_capacity
+		config_get iface "$1" interface
+		config_get metric "$1" metric 1
+		config_get weight "$1" weight 1
+		[ -n "$iface" ] && [ "$metric" -eq "$lowest" ] || return 0
+		config_get member_family "$iface" family ipv4
+		[ "$member_family" = "$family" ] || return 0
+		[ "$(mwan3_get_iface_hotplug_state "$iface")" = online ] || return 0
+		bounded_positive_integer "$weight" 1000 || { valid=0; return 0; }
+
+		rate=$(read_number "$STATE_DIR/rate.$iface" 2>/dev/null || true)
+		capacity=$(read_number "$STATE_DIR/capacity.$iface" 2>/dev/null || true)
+		member_util=$(read_number "$STATE_DIR/member_util.$iface" 2>/dev/null || true)
+		[ -n "$rate" ] && [ -n "$capacity" ] && [ -n "$member_util" ] || {
+			valid=0
+			return 0
+		}
+		available=$((1000 - member_util))
+		[ "$available" -ge "$ADAPTIVE_MIN_HEADROOM" ] || available=$ADAPTIVE_MIN_HEADROOM
+		member_headroom=$((capacity * available))
+		group=$(cat "$STATE_DIR/group_name.$iface" 2>/dev/null || true)
+		if [ "$group" = INVALID ]; then
+			valid=0
+			return 0
+		fi
+		if [ -n "$group" ]; then
+			safe_section_name "$group" || { valid=0; return 0; }
+			group_headroom=$(read_number "$STATE_DIR/group_headroom.$group" 2>/dev/null || true)
+			[ -n "$group_headroom" ] || { valid=0; return 0; }
+			group_sum_file="$STATE_DIR/policy_group_capacity.$fam_short.$policy.$group"
+			current_group_capacity=$(read_number "$group_sum_file" 2>/dev/null || true)
+			[ -n "$current_group_capacity" ] || current_group_capacity=0
+			printf '%s\n' "$((current_group_capacity + capacity))" > "$group_sum_file"
+		fi
+
+		mwan3_get_iface_id id "$iface"
+		[ -n "$id" ] || { valid=0; return 0; }
+		member_count=$((member_count + 1))
+		eval "_adaptive_iface_$member_count=\$iface"
+		eval "_adaptive_id_$member_count=\$id"
+		eval "_adaptive_weight_$member_count=\$weight"
+		eval "_adaptive_capacity_$member_count=\$capacity"
+		eval "_adaptive_headroom_$member_count=\$member_headroom"
+		eval "_adaptive_group_$member_count=\$group"
+	}
+	rm -f "$STATE_DIR"/policy_group_capacity."$fam_short"."$policy".*
+	config_list_foreach "$policy" use_member collect_adaptive_member
+
+	[ "$valid" -eq 1 ] && [ "$member_count" -ge 2 ] || return 0
+	i=1
+	while [ "$i" -le "$member_count" ]; do
+		eval "iface=\${_adaptive_iface_$i}"
+		eval "id=\${_adaptive_id_$i}"
+		eval "weight=\${_adaptive_weight_$i}"
+		eval "capacity=\${_adaptive_capacity_$i}"
+		eval "member_headroom=\${_adaptive_headroom_$i}"
+		eval "group=\${_adaptive_group_$i}"
+		if [ -n "$group" ]; then
+			group_headroom=$(read_number "$STATE_DIR/group_headroom.$group") || return 0
+			group_capacity_sum=$(read_number "$STATE_DIR/policy_group_capacity.$fam_short.$policy.$group") || return 0
+			group_share=$((group_headroom * capacity / group_capacity_sum))
+			[ "$member_headroom" -le "$group_share" ] || member_headroom=$group_share
+		fi
+		raw=$((member_headroom * weight))
+		[ "$raw" -gt 0 ] || raw=1
+		tuples="$tuples $iface:$id:$raw"
+		total_raw=$((total_raw + raw))
+		i=$((i + 1))
+	done
+
+	[ "$total_raw" -gt 0 ] || return 0
+	[ "$ADAPTIVE_BUCKETS" -ge "$member_count" ] || ADAPTIVE_BUCKETS=$member_count
+	_mwan3_build_minimum_smooth_vmap "$tuples" "$ADAPTIVE_BUCKETS" || return 0
+	entries_file="$STATE_DIR/map.$fam_short.$policy"
+	old_entries=$(cat "$entries_file" 2>/dev/null || true)
+	[ "$old_entries" = "$_mwan3_vmap_entries" ] && return 0
+
+	batch="$STATE_DIR/map.$fam_short.$policy.nft"
+	{
+		printf 'flush map inet mwan3 %s\n' "$map"
+		printf 'add element inet mwan3 %s { %s }\n' "$map" "$_mwan3_vmap_entries"
+	} > "$batch"
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		cat "$batch"
+	elif $NFT -f "$batch"; then
+		printf '%s\n' "$_mwan3_vmap_entries" > "$entries_file"
+		LOG info "Adaptive policy $policy/$family updated ($member_count members)"
+	else
+		LOG error "Adaptive policy $policy/$family map update failed"
+	fi
+}
+
+update_adaptive_policy()
+{
+	local policy="$1" mode
+	safe_section_name "$policy" || return 0
+	config_get mode "$policy" mode static
+	[ "$mode" = adaptive ] || return 0
+	update_policy_family "$policy" ipv4
+	[ "$NO_IPV6" -eq 0 ] && update_policy_family "$policy" ipv6
+}
+
+load_adaptive_settings()
+{
+	config_get ADAPTIVE_INTERVAL globals adaptive_interval 3
+	config_get ADAPTIVE_BUCKETS globals adaptive_buckets 256
+	config_get ADAPTIVE_SMOOTHING globals adaptive_smoothing 75
+	config_get ADAPTIVE_MIN_HEADROOM globals adaptive_min_headroom 50
+
+	positive_integer "$ADAPTIVE_INTERVAL" || ADAPTIVE_INTERVAL=3
+	[ "$ADAPTIVE_INTERVAL" -le 30 ] || ADAPTIVE_INTERVAL=30
+	positive_integer "$ADAPTIVE_BUCKETS" || ADAPTIVE_BUCKETS=256
+	[ "$ADAPTIVE_BUCKETS" -ge 16 ] || ADAPTIVE_BUCKETS=16
+	[ "$ADAPTIVE_BUCKETS" -le 1024 ] || ADAPTIVE_BUCKETS=1024
+	case "$ADAPTIVE_SMOOTHING" in ''|*[!0-9]*) ADAPTIVE_SMOOTHING=75 ;; esac
+	[ "$ADAPTIVE_SMOOTHING" -le 95 ] || ADAPTIVE_SMOOTHING=95
+	case "$ADAPTIVE_MIN_HEADROOM" in ''|*[!0-9]*) ADAPTIVE_MIN_HEADROOM=50 ;; esac
+	[ "$ADAPTIVE_MIN_HEADROOM" -ge 1 ] || ADAPTIVE_MIN_HEADROOM=1
+	[ "$ADAPTIVE_MIN_HEADROOM" -le 500 ] || ADAPTIVE_MIN_HEADROOM=500
+}
+
+adaptive_iteration()
+{
+	local now previous_sample
+
+	# Serialize config loading as well as sampling and map replacement. Taking
+	# the lock after config_load would allow a reload to commit new policy state
+	# and then let this process overwrite it using an old UCI snapshot.
+	procd_lock
+	config_load mwan3
+	load_adaptive_settings
+	ADAPTIVE_POLICY_FOUND=0
+	config_foreach policy_has_adaptive_mode policy
+	if [ "$ADAPTIVE_POLICY_FOUND" -ne 1 ]; then
+		flock -u 1000 2>/dev/null || true
+		return 1
+	fi
+
+	now=$(monotonic_seconds 2>/dev/null || true)
+	previous_sample=$(read_number "$STATE_DIR/sample_time" 2>/dev/null || true)
+	SAMPLE_INTERVAL=0
+	if [ -n "$now" ] && [ -n "$previous_sample" ] && [ "$now" -gt "$previous_sample" ]; then
+		SAMPLE_INTERVAL=$((now - previous_sample))
+	fi
+	[ -z "$now" ] || printf '%s\n' "$now" > "$STATE_DIR/sample_time"
+
+	rm -f "$STATE_DIR"/delta.* "$STATE_DIR"/delta_invalid.* \
+		"$STATE_DIR"/group_pressure.* "$STATE_DIR"/group_name.* \
+		"$STATE_DIR"/device_owner.* "$STATE_DIR"/subtract_seen.* \
+		"$STATE_DIR"/group_seen.*
+	config_foreach measure_interface interface
+	config_foreach measure_capacity_group capacity_group
+	config_foreach update_adaptive_policy policy
+	flock -u 1000 2>/dev/null || true
+	return 0
+}
+
+# Running the helper manually must not manufacture mwan3's service-running
+# sentinel. The init service creates both the table and iface_state directory
+# before starting this process.
+$NFT list table inet mwan3 >/dev/null 2>&1 || exit 1
+[ -d /var/run/mwan3/iface_state ] || exit 1
+mwan3_init
+mkdir -p "$STATE_DIR"
+trap 'exit 0' INT TERM
+
+while :; do
+	if adaptive_iteration; then
+		[ "$RUN_ONCE" -eq 1 ] && exit 0
+		sleep "$ADAPTIVE_INTERVAL"
+	else
+		[ "$RUN_ONCE" -eq 1 ] && exit 0
+		sleep 30
+	fi
+done

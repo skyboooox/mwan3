@@ -1,0 +1,28 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: |
+          sh -n files/lib/mwan3/adaptive.sh
+          sh -n files/lib/mwan3/common.sh
+          sh -n files/lib/mwan3/mwan3.sh
+          sh -n files/etc/init.d/mwan3
+          sh -n files/usr/sbin/mwan3-adaptive
+          sh -n files/usr/sbin/mwan3-lb-test
+      - name: Test adaptive scheduler
+        run: sh tests/test-adaptive.sh
+      - name: Install nftables
+        run: sudo apt-get update && sudo apt-get install -y nftables
+      - name: Check nft verdict-map integration
+        run: sudo sh tests/test-nft-syntax.sh
