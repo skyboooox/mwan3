@@ -9,7 +9,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mwan3
 PKG_VERSION:=3.6.11
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_MAINTAINER:=Florian Eckert <fe@dev.tdt.de>
 PKG_LICENSE:=GPL-2.0
@@ -201,6 +201,8 @@ define Package/mwan3/install
 	$(INSTALL_DIR) $(1)/lib/mwan3
 	$(INSTALL_DATA) ./files/lib/mwan3/common.sh \
 		$(1)/lib/mwan3/
+	$(INSTALL_DATA) ./files/lib/mwan3/adaptive.sh \
+		$(1)/lib/mwan3/
 	$(INSTALL_DATA) ./files/lib/mwan3/mwan3.sh \
 		$(1)/lib/mwan3/
 	$(INSTALL_DATA) ./files/lib/mwan3/mwan3-skeleton.nft \
@@ -234,6 +236,8 @@ define Package/mwan3/install
 	$(INSTALL_BIN) ./files/usr/sbin/mwan3-lb-test \
 		$(1)/usr/sbin/
 	$(INSTALL_BIN) ./files/usr/sbin/mwan3-diag \
+		$(1)/usr/sbin/
+	$(INSTALL_BIN) ./files/usr/sbin/mwan3-adaptive \
 		$(1)/usr/sbin/
 
 	$(INSTALL_DIR) $(1)/etc

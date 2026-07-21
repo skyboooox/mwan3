@@ -6,6 +6,13 @@ config globals 'globals'
 	# option iif_rule_base '1000'
 	# option fwmark_rule_base '2000'
 	# option unreachable_rule_base '3000'
+	# Adaptive policies are opt-in. Buckets are atomically reassigned for new
+	# connections only; established conntrack marks are never migrated.
+	# option adaptive_interval '3'
+	# option adaptive_buckets '256'
+	# option static_balance_buckets '256'
+	# option adaptive_smoothing '75'
+	# option adaptive_min_headroom '50'
 
 config interface 'wan'
 	option enabled '0'
@@ -15,6 +22,13 @@ config interface 'wan'
 	list track_ip '208.67.220.220'
 	option family 'ipv4'
 	option reliability '2'
+	# Nominal downstream capacity in Mbit/s and the hardware-visible RX
+	# counter used by adaptive policies. Both are required before this member
+	# participates in adaptive feedback.
+	# option capacity_down '1000'
+	# option telemetry_device 'eth1'
+	# Subtract child/macvlan counters when the parent includes their traffic.
+	# list telemetry_subtract 'eth1-wanb'
 
 config interface 'wan6'
 	option enabled '0'
@@ -106,6 +120,14 @@ config policy 'balanced'
 	list use_member 'wanb_m1_w3'
 	list use_member 'wan6_m1_w3'
 	list use_member 'wanb6_m1_w3'
+	# option mode 'adaptive'
+
+# Capacity groups model members that share one upstream bottleneck. The group
+# utilization is applied to every listed member in addition to its own load.
+# config capacity_group 'shared_uplink'
+# 	option capacity_down '1300'
+# 	list interface 'wan'
+# 	list interface 'wanb'
 
 config policy 'wan_wanb'
 	list use_member 'wan_m1_w3'

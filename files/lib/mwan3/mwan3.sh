@@ -2,6 +2,7 @@
 
 . "${IPKG_INSTROOT}/usr/share/libubox/jshn.sh"
 . "${IPKG_INSTROOT}/lib/mwan3/common.sh"
+. "${IPKG_INSTROOT}/lib/mwan3/adaptive.sh"
 
 CONNTRACK_FILE="/proc/net/nf_conntrack"
 MWAN3IPCHECK="mwan3ipcheck"
@@ -1139,13 +1140,27 @@ mwan3_set_policy()
 mwan3_create_policies_nft()
 {
 	local last_resort lowest_metric_v4 lowest_metric_v6 total_weight_v4 total_weight_v6
-	local policy policy_members_v4 policy_members_v6
+	local policy policy_members_v4 policy_members_v6 policy_mode adaptive_buckets static_buckets
 
 	policy="$1"
 	policy_members_v4=""
 	policy_members_v6=""
 
 	config_get last_resort "$1" last_resort unreachable
+	config_get policy_mode "$1" mode static
+	config_get adaptive_buckets globals adaptive_buckets 256
+	config_get static_buckets globals static_balance_buckets 256
+	case "$adaptive_buckets" in
+		''|*[!0-9]*) adaptive_buckets=256 ;;
+	esac
+	[ "$adaptive_buckets" -ge 16 ] 2>/dev/null || adaptive_buckets=16
+	[ "$adaptive_buckets" -le 1024 ] 2>/dev/null || adaptive_buckets=1024
+	case "$static_buckets" in
+		''|*[!0-9]*) static_buckets=256 ;;
+	esac
+	[ "$static_buckets" -ge 16 ] 2>/dev/null || static_buckets=16
+	[ "$static_buckets" -le 1024 ] 2>/dev/null || static_buckets=1024
+	[ "$policy_mode" = adaptive ] || policy_mode=static
 
 	if [ "$1" != "$(echo "$1" | cut -c1-15)" ]; then
 		LOG warn "Policy $1 exceeds max of 15 chars. Not setting policy" && return 0
@@ -1169,11 +1184,30 @@ mwan3_create_policies_nft()
 	# For mixed IPv4/IPv6 policies, add per-family nfproto guards so each
 	# family's traffic is only directed to members of the matching address family.
 
-	local member iface id weight mark total_weight running map_entries nfproto_guard
-	local _fam _members_cur _total_fam _has_v4 _has_v6
+	local member iface id weight mark total_weight map_entries nfproto_guard
+	local _fam _members_cur _total_fam _has_v4 _has_v6 _count_v4 _count_v6
+	local map_name map_slots member_count
 
 	_has_v4=0; [ -n "$(echo "$policy_members_v4" | tr -d ' ')" ] && _has_v4=1
 	_has_v6=0; [ -n "$(echo "$policy_members_v6" | tr -d ' ')" ] && _has_v6=1
+	_count_v4=$(echo "$policy_members_v4" | wc -w)
+	_count_v6=$(echo "$policy_members_v6" | wc -w)
+
+	# Outside a full reload, remove maps that a policy mode/family transition
+	# left behind.  The reload preamble already queues deletion of every
+	# adaptive map, so querying and deleting again inside its batch would emit
+	# duplicate delete statements.
+	if [ "$MWAN3_BATCH_DEPTH" -eq 0 ]; then
+		for _fam in v4 v6; do
+			map_name="mwan3_adaptive_${_fam}_${policy}"
+			if [ "$policy_mode" != adaptive ] || \
+			   { [ "$_fam" = v4 ] && [ "$_count_v4" -lt 2 ]; } || \
+			   { [ "$_fam" = v6 ] && [ "$_count_v6" -lt 2 ]; }; then
+				$NFT flush map inet mwan3 "$map_name" 2>/dev/null
+				$NFT delete map inet mwan3 "$map_name" 2>/dev/null
+			fi
+		done
+	fi
 
 	total_weight=0
 	for member in $policy_members_v4 $policy_members_v6; do
@@ -1211,7 +1245,10 @@ mwan3_create_policies_nft()
 					$nfproto_guard meta mark \& "$MMX_MASK" == 0 \
 					"$(mwan3_nft_mark_expr $mark $MMX_MASK)"
 			else
-				# Multiple members: use numgen for load balancing.
+				# Multiple members: use smooth weighted round-robin for new
+				# connections.  Static policies use one exact weight cycle;
+				# adaptive policies use a fixed named map that the controller
+				# can replace atomically without touching established ct marks.
 				# Non-destructive: dispatch via verdict map into per-mark
 				# OR-immediate setter chains. The previous form
 				#   meta mark set numgen ... map { range : 0xMARK }
@@ -1219,24 +1256,47 @@ mwan3_create_policies_nft()
 				# would clobber pbr's marks if pbr ran first. The vmap form
 				# preserves all bits outside MMX.
 
-				running=0
-				map_entries=""
-				for member in $_members_cur; do
-					iface="${member%%:*}"
-					id="${member#*:}"
-					id="${id%%:*}"
-					weight="${member##*:}"
-					mark=$(mwan3_id2mask id MMX_MASK)
-					local end=$((running + weight - 1))
-					if [ -n "$map_entries" ]; then
-						map_entries="$map_entries, "
-					fi
-					map_entries="${map_entries}${running}-${end} : jump mwan3_or_meta_$(mwan3_or_chain_suffix "$mark")"
-					running=$((end + 1))
-				done
-				mwan3_nft_exec add rule inet mwan3 "mwan3_policy_$policy" \
-					$nfproto_guard meta mark \& "$MMX_MASK" == 0 \
-					"numgen inc mod $_total_fam vmap { $map_entries }"
+				if [ "$policy_mode" != adaptive ]; then
+					_mwan3_reduce_member_weights "$_members_cur" || {
+						LOG error "Could not reduce weights for policy $policy"
+						continue
+					}
+					_members_cur=$_mwan3_reduced_members
+					_total_fam=$_mwan3_reduced_total
+				fi
+				member_count=$(echo "$_members_cur" | wc -w)
+				map_slots=$_total_fam
+				if [ "$policy_mode" = adaptive ]; then
+					map_slots=$adaptive_buckets
+					[ "$map_slots" -ge "$member_count" ] || map_slots=$member_count
+					_mwan3_build_minimum_smooth_vmap "$_members_cur" "$map_slots"
+				elif [ "$map_slots" -gt "$static_buckets" ]; then
+					map_slots=$static_buckets
+					[ "$map_slots" -ge "$member_count" ] || map_slots=$member_count
+					_mwan3_build_minimum_smooth_vmap "$_members_cur" "$map_slots"
+				else
+					_mwan3_build_smooth_vmap "$_members_cur" "$map_slots"
+				fi || {
+					LOG error "Could not build load-balancing map for policy $policy"
+					continue
+				}
+				map_entries=$_mwan3_vmap_entries
+
+				if [ "$policy_mode" = adaptive ]; then
+					map_name="mwan3_adaptive_${_fam}_${policy}"
+					mwan3_nft_exec add map inet mwan3 "$map_name" \
+						"{ type mark : verdict; }"
+					mwan3_nft_exec flush map inet mwan3 "$map_name"
+					mwan3_nft_exec add element inet mwan3 "$map_name" \
+						"{ $map_entries }"
+					mwan3_nft_exec add rule inet mwan3 "mwan3_policy_$policy" \
+						$nfproto_guard meta mark \& "$MMX_MASK" == 0 \
+						"numgen inc mod $map_slots vmap @$map_name"
+				else
+					mwan3_nft_exec add rule inet mwan3 "mwan3_policy_$policy" \
+						$nfproto_guard meta mark \& "$MMX_MASK" == 0 \
+						"numgen inc mod $map_slots vmap { $map_entries }"
+				fi
 			fi
 		done
 	fi
@@ -1270,7 +1330,7 @@ mwan3_set_policies_nft()
 	# Inside a batch the preamble already deleted all dynamic chains.
 
 	if [ "$MWAN3_BATCH_DEPTH" -eq 0 ]; then
-		local valid_policies="" chain
+		local valid_policies="" chain mapname map_policy
 
 		collect_valid_policy() { valid_policies="$valid_policies ${1} "; }
 		config_foreach collect_valid_policy policy
@@ -1282,6 +1342,20 @@ mwan3_set_policies_nft()
 				*)
 					LOG debug "Deleting orphaned policy chain mwan3_policy_${chain}"
 					$NFT delete chain inet mwan3 "mwan3_policy_${chain}" 2>/dev/null
+					;;
+			esac
+		done
+
+		for mapname in $($NFT list maps inet mwan3 2>/dev/null | \
+				awk '$1 == "map" && $2 ~ /^mwan3_adaptive_v[46]_/ { print $2 }'); do
+			map_policy="${mapname#mwan3_adaptive_v4_}"
+			map_policy="${map_policy#mwan3_adaptive_v6_}"
+			case "$valid_policies" in
+				*" ${map_policy} "*) ;;
+				*)
+					LOG debug "Deleting orphaned adaptive map ${mapname}"
+					$NFT flush map inet mwan3 "$mapname" 2>/dev/null
+					$NFT delete map inet mwan3 "$mapname" 2>/dev/null
 					;;
 			esac
 		done
